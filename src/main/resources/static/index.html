@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spring Kafka Analytics Dashboard</title>
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 16px; }
+        #controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
+        #publishForm { display:flex; gap:8px; align-items:center; }
+        #chartContainer { width:100%; max-width:1000px; }
+        canvas { background: #fff; border: 1px solid #ddd; }
+        .small { font-size: 0.9rem; color: #666; }
+    </style>
+</head>
+<body>
+<h1>Analytics Dashboard</h1>
+<div id="controls">
+    <div>
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <span class="small">Stream: <span id="status">stopped</span></span>
+    </div>
+
+    <form id="publishForm">
+        <label for="pagename">name</label>
+        <input id="pagename" name="name" value="HomePage" />
+        <label for="topic">topic</label>
+        <input id="topic" name="topic" value="T6" />
+        <button id="publishBtn" type="button">Publish</button>
+    </form>
+</div>
+
+<div id="chartContainer">
+    <canvas id="analyticsChart" height="300"></canvas>
+</div>
+
+<div style="margin-top:12px;">
+    <strong>Notes:</strong>
+    <ul>
+        <li>The chart subscribes to <code>/analytics</code> (SSE). Make sure the Spring app is running on <code>http://localhost:8080</code>.</li>
+        <li>Use the publish form to send a test <code>PageEvent</code> to the configured topic (default <code>T6</code>).</li>
+    </ul>
+</div>
+
+<script>
+// Configuration
+const MAX_POINTS = 60; // sliding window length (seconds / observations)
+const SSE_URL = '/analytics';
+
+// Chart state
+const datasets = {}; // key => { dataset, data }
+let chart = null;
+let sse = null;
+
+function randomColor(index) {
+    // nice palette
+    const palette = [
+        '#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf'
+    ];
+    return palette[index % palette.length];
+}
+
+function ensureDataset(key) {
+    if (datasets[key]) return datasets[key];
+    const idx = Object.keys(datasets).length;
+    const color = randomColor(idx);
+    const dataset = {
+        label: key,
+        borderColor: color,
+        backgroundColor: color + '33',
+        fill: true,
+        cubicInterpolationMode: 'monotone',
+        tension: 0.3,
+        data: []
+    };
+    datasets[key] = { dataset };
+    chart.data.datasets.push(dataset);
+    return datasets[key];
+}
+
+function shiftOldPoints() {
+    // keep last MAX_POINTS
+    chart.data.datasets.forEach(ds => {
+        if (ds.data.length > MAX_POINTS) ds.data.splice(0, ds.data.length - MAX_POINTS);
+    });
+    if (chart.data.labels.length > MAX_POINTS) chart.data.labels.splice(0, chart.data.labels.length - MAX_POINTS);
+}
+
+function startSSE() {
+    if (sse) return;
+    sse = new EventSource(SSE_URL);
+    document.getElementById('status').textContent = 'connecting';
+    sse.onopen = () => { document.getElementById('status').textContent = 'running'; document.getElementById('startBtn').disabled = true; document.getElementById('stopBtn').disabled = false; };
+    sse.onerror = (e) => { document.getElementById('status').textContent = 'error/disconnected'; console.warn('SSE error', e); };
+    sse.onmessage = (evt) => {
+        try {
+            const data = JSON.parse(evt.data);
+            const ts = new Date();
+            // ensure timestamp label
+            chart.data.labels.push(ts.toLocaleTimeString());
+            Object.keys(data).forEach(k => {
+                const val = data[k] == null ? 0 : Number(data[k]);
+                const ds = ensureDataset(k).dataset;
+                ds.data.push({ x: ts, y: val });
+            });
+            // If some datasets have no value for this tick, push null to keep alignment
+            chart.data.datasets.forEach(ds => {
+                const last = ds.data[ds.data.length - 1];
+                if (!last || last.x.toLocaleTimeString() !== ts.toLocaleTimeString()) {
+                    ds.data.push({ x: ts, y: null });
+                }
+            });
+            shiftOldPoints();
+            chart.update('none');
+        } catch (err) {
+            console.error('Failed to parse SSE payload', err, evt.data);
+        }
+    };
+}
+
+function stopSSE() {
+    if (!sse) return;
+    sse.close();
+    sse = null;
+    document.getElementById('status').textContent = 'stopped';
+    document.getElementById('startBtn').disabled = false; document.getElementById('stopBtn').disabled = true;
+}
+
+function setupChart() {
+    const ctx = document.getElementById('analyticsChart').getContext('2d');
+    chart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: [], datasets: [] },
+        options: {
+            animation: false,
+            parsing: false,
+            normalized: true,
+            scales: {
+                x: { type: 'time', time: { unit: 'second', tooltipFormat: 'HH:mm:ss' }, title: { display: false } },
+                y: { beginAtZero: true }
+            },
+            plugins: { legend: { position: 'bottom' } }
+        }
+    });
+}
+
+// Publish helper
+async function publishEvent() {
+    const name = document.getElementById('pagename').value || 'HomePage';
+    const topic = document.getElementById('topic').value || 'T6';
+    const url = `/publish?name=${encodeURIComponent(name)}&topic=${encodeURIComponent(topic)}`;
+    try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const body = await res.json();
+        console.log('Published', body);
+        alert('Published event: ' + JSON.stringify(body));
+    } catch (err) {
+        console.error('Failed to publish', err);
+        alert('Publish failed: ' + err.message);
+    }
+}
+
+// Setup
+document.getElementById('startBtn').addEventListener('click', startSSE);
+document.getElementById('stopBtn').addEventListener('click', stopSSE);
+document.getElementById('publishBtn').addEventListener('click', publishEvent);
+
+setupChart();
+// auto-start
+startSSE();
+</script>
+</body>
+</html>
